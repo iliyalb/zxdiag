@@ -1,3 +1,4 @@
+vendor/
 .zig-cache/
 zig-out/
 /release/
