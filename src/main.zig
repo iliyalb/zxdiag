@@ -156,16 +156,144 @@ fn getSystemInfo() !std.ArrayList(u8) {
     defer if (!std.mem.eql(u8, cpu_info, "N/A")) std.heap.page_allocator.free(cpu_info);
     var cpu_lines = std.mem.split(u8, cpu_info, "\n");
     var cpu_model: []const u8 = "N/A";
+    var cpu_speed: []const u8 = "N/A";
     while (cpu_lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "model name")) {
             if (std.mem.indexOf(u8, line, ":")) |colon_idx| {
                 cpu_model = std.mem.trim(u8, line[colon_idx + 1..], " \t");
-                break;
+            }
+        } else if (std.mem.startsWith(u8, line, "cpu MHz")) {
+            if (std.mem.indexOf(u8, line, ":")) |colon_idx| {
+                cpu_speed = std.mem.trim(u8, line[colon_idx + 1..], " \t");
             }
         }
     }
     try info.appendSlice("Processor: ");
     try info.appendSlice(cpu_model);
+    try info.appendSlice("\n");
+    try info.appendSlice("CPU Speed: ");
+    try info.appendSlice(cpu_speed);
+    try info.appendSlice(" MHz\n");
+
+    // Get GPU info
+    const gpu_info = try std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{"sh", "-c", "lspci -v | grep -A 1 -i vga"},
+    });
+    try info.appendSlice("GPU: ");
+    if (gpu_info.term.Exited == 0 and gpu_info.stdout.len > 0) {
+        var gpu_lines = std.mem.split(u8, gpu_info.stdout, "\n");
+        if (gpu_lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, ":")) |colon_idx| {
+                const full_desc = std.mem.trim(u8, line[colon_idx + 1..], " \t");
+                
+                // Try to extract the brand and model
+                var gpu_name: []const u8 = "N/A";
+                
+                if (std.mem.indexOf(u8, full_desc, "AMD")) |_| {
+                    if (std.mem.indexOf(u8, full_desc, "Radeon")) |radeon_idx| {
+                        var words = std.mem.split(u8, full_desc[radeon_idx..], " ");
+                        _ = words.next(); // Skip "Radeon"
+                        var model_parts = std.ArrayList(u8).init(std.heap.page_allocator);
+                        defer model_parts.deinit();
+                        
+                        // Collect up to 3 parts after "Radeon" to get full model number
+                        var part_count: u8 = 0;
+                        while (words.next()) |part| : (part_count += 1) {
+                            if (part_count > 0) {
+                                try model_parts.appendSlice(" ");
+                            }
+                            // Skip common non-model words
+                            if (!std.mem.eql(u8, part, "Graphics") and
+                                !std.mem.eql(u8, part, "Corporation") and
+                                !std.mem.eql(u8, part, "Advanced") and
+                                !std.mem.eql(u8, part, "Technologies") and
+                                !std.mem.eql(u8, part, "Inc.") and
+                                !std.mem.eql(u8, part, "[AMD/ATI]") and
+                                !std.mem.eql(u8, part, "AMD") and
+                                !std.mem.eql(u8, part, "ATI")) {
+                                try model_parts.appendSlice(part);
+                                if (part_count >= 2) break; // Get up to 3 parts (RX 6900 XT)
+                            } else {
+                                part_count -= 1; // Don't count skipped words
+                            }
+                        }
+                        
+                        if (model_parts.items.len > 0) {
+                            gpu_name = try std.fmt.allocPrint(std.heap.page_allocator, "AMD Radeon {s}", .{model_parts.items});
+                        } else {
+                            gpu_name = "AMD Radeon";
+                        }
+                    } else {
+                        gpu_name = "AMD";
+                    }
+                } else if (std.mem.indexOf(u8, full_desc, "NVIDIA")) |_| {
+                    if (std.mem.indexOf(u8, full_desc, "GeForce")) |geforce_idx| {
+                        var words = std.mem.split(u8, full_desc[geforce_idx..], " ");
+                        _ = words.next(); // Skip "GeForce"
+                        if (words.next()) |model| {
+                            gpu_name = try std.fmt.allocPrint(std.heap.page_allocator, "NVIDIA GeForce {s}", .{model});
+                        } else {
+                            gpu_name = "NVIDIA GeForce";
+                        }
+                    } else {
+                        gpu_name = "NVIDIA";
+                    }
+                } else if (std.mem.indexOf(u8, full_desc, "Intel")) |_| {
+                    if (std.mem.indexOf(u8, full_desc, "HD Graphics")) |_| {
+                        gpu_name = "Intel HD Graphics";
+                    } else if (std.mem.indexOf(u8, full_desc, "UHD Graphics")) |_| {
+                        gpu_name = "Intel UHD Graphics";
+                    } else if (std.mem.indexOf(u8, full_desc, "Iris")) |_| {
+                        gpu_name = "Intel Iris";
+                    } else {
+                        var words = std.mem.split(u8, full_desc, " ");
+                        while (words.next()) |word| {
+                            if (std.mem.indexOf(u8, word, "Graphics")) |_| {
+                                gpu_name = try std.fmt.allocPrint(std.heap.page_allocator, "Intel {s}", .{word});
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                try info.appendSlice(gpu_name);
+                if (!std.mem.eql(u8, gpu_name, "N/A")) {
+                    if (std.mem.indexOf(u8, gpu_name, "allocPrint")) |_| {
+                        std.heap.page_allocator.free(gpu_name);
+                    }
+                }
+            } else {
+                try info.appendSlice("N/A");
+            }
+        } else {
+            try info.appendSlice("N/A");
+        }
+    } else {
+        try info.appendSlice("N/A");
+    }
+    try info.appendSlice("\n");
+
+    // Get GPU VRAM
+    const gpu_vram = try std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{"sh", "-c", "glxinfo | grep 'Video memory' || glxinfo | grep 'Dedicated video memory'"},
+    });
+    try info.appendSlice("GPU VRAM: ");
+    if (gpu_vram.term.Exited == 0 and gpu_vram.stdout.len > 0) {
+        var vram_lines = std.mem.split(u8, gpu_vram.stdout, "\n");
+        if (vram_lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, ":")) |colon_idx| {
+                try info.appendSlice(std.mem.trim(u8, line[colon_idx + 1..], " \t"));
+            } else {
+                try info.appendSlice(line);
+            }
+        } else {
+            try info.appendSlice("N/A");
+        }
+    } else {
+        try info.appendSlice("N/A");
+    }
     try info.appendSlice("\n");
 
     // Get memory info
